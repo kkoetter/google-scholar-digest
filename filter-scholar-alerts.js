@@ -114,6 +114,130 @@ function parse_citations_email(plainBody) {
   return parsed_papers
 }
 
+/*Parse the body for "new articles" emails which come as HTML*/
+function parse_new_article_email(htmlBody, subject) {
+  var parsed_papers = {}
+
+  // Extract title - look for the main title link pattern in Google Scholar emails
+  var titleMatch = htmlBody.match(/<h3[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/i);
+  if (!titleMatch) {
+    // Try alternative pattern
+    titleMatch = htmlBody.match(/<a[^>]*class="[^"]*gse_alrt_title[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/i);
+  }
+
+  if (titleMatch) {
+    var url = titleMatch[1].replace(/&amp;/g, '&'); // Decode HTML entities
+    var title = titleMatch[2].replace(/<[^>]*>/g, '').trim(); // Strip HTML tags
+
+    // Extract metadata (authors, venue, year) - usually in a div with specific styling
+    var metadata = '';
+    var metadataMatch = htmlBody.match(/<div[^>]*color:#006621[^>]*>(.*?)<\/div>/i);
+    if (metadataMatch) {
+      metadata = metadataMatch[1].replace(/<[^>]*>/g, '').trim();
+    }
+
+    // Extract snippet - usually after metadata
+    var snippet = '';
+    var snippetMatch = htmlBody.match(/<div[^>]*class="[^"]*gse_alrt_sni[^"]*"[^>]*>(.*?)<\/div>/i);
+    if (!snippetMatch) {
+      // Try alternative pattern for snippet
+      snippetMatch = htmlBody.match(/<div[^>]*line-height:17px[^>]*>(.*?)<\/div>/i);
+    }
+    if (snippetMatch) {
+      snippet = snippetMatch[1].replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]*>/g, '').trim();
+    }
+
+    var paper_dict = {
+      "title": title,
+      "url": url,
+      "metadata": metadata,
+      "cites": "", // New articles don't cite anyone
+      "snippet": snippet,
+      "source": "new_article" // Mark source type
+    }
+
+    parsed_papers[url] = paper_dict; // Use URL as key for better deduplication
+  }
+
+  return parsed_papers;
+}
+
+/*Unified function to deduplicate and collate papers from all sources (citations and new articles)
+Takes citation papers (keyed by author) and new article papers, deduplicates by URL, and returns sorted list*/
+function collate_all_papers(authorname2parsed_papers, new_article_papers){
+  var url2paper = {}
+  var url2authors = {}
+
+  // Process citation papers (Type 1)
+  for (const [authorname, title2parsed_papers] of Object.entries(authorname2parsed_papers)) {
+    for (const [title, parsed_paper] of Object.entries(title2parsed_papers)) {
+      var url = parsed_paper['url'];
+
+      if (url in url2paper) {
+        // Paper already exists, add this author to the citations list
+        if (url in url2authors) {
+          url2authors[url].push(authorname);
+        } else {
+          url2authors[url] = [authorname];
+        }
+
+        // Add citation info
+        if (parsed_paper['cites'] == ''){
+          url2paper[url]['cites'].push(`Cites ${authorname}`);
+        } else {
+          url2paper[url]['cites'].push(`Cites ${authorname}: ${parsed_paper['cites']}`);
+        }
+      } else {
+        // First time seeing this paper
+        url2authors[url] = [authorname];
+        url2paper[url] = parsed_paper;
+        url2paper[url]['source'] = 'citation';
+
+        if (parsed_paper['cites'] == ''){
+          url2paper[url]['cites'] = [`Cites ${authorname}`];
+        } else {
+          url2paper[url]['cites'] = [`Cites ${authorname}: ${parsed_paper['cites']}`];
+        }
+      }
+    }
+  }
+
+  // Process new article papers (Type 2)
+  for (const [url, parsed_paper] of Object.entries(new_article_papers)) {
+    if (url in url2paper) {
+      // Paper already exists in citations - just mark that it's also from new articles
+      url2paper[url]['source'] = 'both'; // Appears in both citation alerts and new article alerts
+    } else {
+      // New paper not seen in citations
+      url2paper[url] = parsed_paper;
+      url2paper[url]['source'] = 'new_article';
+      url2paper[url]['cites'] = []; // No citations for new articles
+      url2authors[url] = [];
+    }
+  }
+
+  // Sort papers: first by number of citations (descending), then by source type
+  var sorted_urls = Object.keys(url2paper).sort((a, b) => {
+    var a_citation_count = url2authors[a] ? url2authors[a].length : 0;
+    var b_citation_count = url2authors[b] ? url2authors[b].length : 0;
+
+    if (a_citation_count !== b_citation_count) {
+      return b_citation_count - a_citation_count; // Sort by citation count descending
+    }
+
+    // If same citation count, prioritize by source (citation > both > new_article)
+    var source_priority = {'citation': 0, 'both': 1, 'new_article': 2};
+    return source_priority[url2paper[a]['source']] - source_priority[url2paper[b]['source']];
+  });
+
+  var sorted_papers = []
+  for (let j = 0; j < sorted_urls.length; j++){
+    sorted_papers.push(url2paper[sorted_urls[j]])
+  }
+
+  return sorted_papers;
+}
+
 /*Given a dictionary with authorname mapped to all the papers citing their work
 count up papers which are citing multiple authors and gather one dict*/
 function collate_author_papers(authorname2parsed_papers){
@@ -170,6 +294,17 @@ function format_citations_email(sorted_paper_dicts, skip_snippet_cites = false) 
         const paper = sorted_paper_dicts[i];
 
         formatted_papers += `<h3 style="font-weight:normal;margin:0;font-size:17px;line-height:20px;"><a href=${paper.url} class="gse_alrt_title" style="font-size:17px;color:#1a0dab;line-height:22px">${paper.title}</a></h3>`;
+
+        // Add source badge
+        if (paper.source === 'new_article') {
+          formatted_papers += `<div style="display:inline-block;background-color:#e8f0fe;color:#1967d2;padding:2px 8px;border-radius:3px;font-size:11px;margin:4px 0;">Keyword Alert</div>`;
+        } else if (paper.source === 'both') {
+          formatted_papers += `<div style="display:inline-block;background-color:#fce8e6;color:#c5221f;padding:2px 8px;border-radius:3px;font-size:11px;margin:4px 4px 4px 0;">Citation Alert</div>`;
+          formatted_papers += `<div style="display:inline-block;background-color:#e8f0fe;color:#1967d2;padding:2px 8px;border-radius:3px;font-size:11px;margin:4px 0;">Keyword Alert</div>`;
+        } else if (paper.source === 'citation') {
+          formatted_papers += `<div style="display:inline-block;background-color:#fce8e6;color:#c5221f;padding:2px 8px;border-radius:3px;font-size:11px;margin:4px 0;">Citation Alert</div>`;
+        }
+
         if (paper.metadata != ''){
           formatted_papers += `<div style="color:#006621;line-height:18px">${paper.metadata}</div>`;
         }
@@ -177,7 +312,7 @@ function format_citations_email(sorted_paper_dicts, skip_snippet_cites = false) 
           formatted_snippet = format_snippet_width(paper.snippet, 100)
           formatted_papers += `<div class="gse_alrt_sni" style="line-height:17px">${formatted_snippet}</div>`;
         }
-        if (paper.cites.length != 0){
+        if (paper.cites && paper.cites.length != 0){
           formatted_papers += '<table cellpadding="0" cellspacing="0" border="0" style="padding:8px 0>'
           if (skip_snippet_cites){ // The script runs into a max email length limit if collating over multiple days
             formatted_papers += `<tr><td style="line-height:18px;font-size:12px;padding-right:8px;" valign="top">•</td><td style="line-height:18px;font-size:12px;mso-padding-alt:8px 0 4px 0;"><span style="mso-text-raise:4px;">Cites: ${paper.cites.length} subscribed authors.</span></td></tr>`
@@ -215,6 +350,64 @@ function format_snippet_width(snippet, charsPerLine) {
     }
 
     return formattedSnippet;
+}
+
+/*Send unified digest email with papers from all sources*/
+function send_unified_digest(batch_paper_dicts, total_citing_papers, total_authors, total_new_articles, total_unique_papers, batch_idx=0){
+  var now = new Date();
+  var pretty_now = Utilities.formatDate(now, Session.getScriptTimeZone(), "EEE MMM dd yyyy");
+  var paper_body = format_citations_email(batch_paper_dicts)
+  var merged_body = '';
+  merged_body += '<html><body>';
+  merged_body += '<!doctype html><html xmlns="http://www.w3.org/1999/xhtml" xmlns:o="urn:schemas-microsoft-com:office:office"><head><style>body{background-color:#fff}.gse_alrt_title{text-decoration:none}.gse_alrt_title:hover{text-decoration:underline} @media screen and (max-width: 599px) {.gse_alrt_sni br{display:none;}}</style></head>'
+
+  // Create summary header
+  var summary = `Collated ${total_unique_papers} unique papers`;
+  if (total_citing_papers > 0 && total_new_articles > 0) {
+    summary += ` (${total_citing_papers} citation alerts to ${total_authors} authors, ${total_new_articles} keyword alerts)`;
+  } else if (total_citing_papers > 0) {
+    summary += ` (${total_citing_papers} citation alerts to ${total_authors} authors)`;
+  } else if (total_new_articles > 0) {
+    summary += ` (${total_new_articles} keyword alerts)`;
+  }
+
+  if (batch_idx == 0) {
+    merged_body += `<h2>${summary}</h2>`;
+  } else {
+    merged_body += `<h2>${summary} - Part ${batch_idx}, ${batch_paper_dicts.length}/${total_unique_papers}</h2>`;
+  }
+
+  merged_body += paper_body
+  merged_body += '</body></html>';
+
+  var merged_subject = batch_idx == 0
+    ? `Google Scholar Digest for ${pretty_now}`
+    : `Google Scholar Digest for ${pretty_now} - Part ${batch_idx}`;
+
+  if (merged_body !== '<html><body></body></html>') {
+    GmailApp.sendEmail(Session.getActiveUser().getEmail(), merged_subject, '', {
+      htmlBody: merged_body
+    });
+    Logger.log('Unified digest email sent successfully.');
+  } else {
+    Logger.log('No matching emails found.');
+  }
+}
+
+/*Send unified digest in batches if too many papers*/
+function batch_send_unified_digest(sorted_paper_dicts, total_citing_papers, total_authors, total_new_articles, total_unique_papers, paper_per_email = 250){
+  var start = 0
+  var batch_idx = 1
+  while (start+paper_per_email < sorted_paper_dicts.length){
+    var batch_papers = sorted_paper_dicts.slice(start, start+paper_per_email)
+    send_unified_digest(batch_papers, total_citing_papers, total_authors, total_new_articles, total_unique_papers, batch_idx)
+    start += paper_per_email
+    batch_idx += 1
+  }
+  if (start < sorted_paper_dicts.length){ // handle the last batch
+    var batch_papers = sorted_paper_dicts.slice(start)
+    send_unified_digest(batch_papers, total_citing_papers, total_authors, total_new_articles, total_unique_papers, batch_idx)
+  }
 }
 
 /*Given a batch of paper dicts, format and send them - this can be called from
@@ -278,7 +471,9 @@ function mergeRecentScholarAlerts() {
 
   var author2parsed_papers = {}
   var total_citing_papers = 0
-  var new_articles = [] // Changed to array to store individual articles
+  var new_article_papers = {} // Dictionary keyed by URL
+  var total_new_articles = 0
+
   for (var i = 0; i < threads.length; i++) {
     var messages = threads[i].getMessages();
     for (var j = 0; j < messages.length; j++) {
@@ -307,29 +502,26 @@ function mergeRecentScholarAlerts() {
         total_citing_papers += Object.keys(titles2parsed_paper_dict).length
       }
       else{
-        // Store individual articles instead of concatenating
-        new_articles.push({
-          subject: message.getSubject(),
-          body: message.getBody()
-        });
+        // Parse new article emails
+        message_body = message.getBody();
+        parsed_article = parse_new_article_email(message_body, subject);
+        // Merge parsed articles (keyed by URL)
+        new_article_papers = Object.assign(new_article_papers, parsed_article);
+        total_new_articles += Object.keys(parsed_article).length;
       }
     }
   }
 
-  // Handle citations
-  var sorted_paper_dicts = collate_author_papers(author2parsed_papers)
+  // Use unified collation function
+  var sorted_paper_dicts = collate_all_papers(author2parsed_papers, new_article_papers)
   var total_authors = Object.keys(author2parsed_papers).length
   var total_unique_papers = sorted_paper_dicts.length
 
+  // Send unified digest
   if (total_unique_papers <= global_config.papers_per_merged_email){
-    send_citation_email(sorted_paper_dicts, total_citing_papers, total_authors, total_unique_papers, 0)
+    send_unified_digest(sorted_paper_dicts, total_citing_papers, total_authors, total_new_articles, total_unique_papers, 0)
   } else {
-    batch_send_citation_email(sorted_paper_dicts, total_citing_papers, total_authors, total_unique_papers, global_config.papers_per_merged_email)
-  }
-
-  // Handle new articles with batching
-  if (new_articles.length > 0) {
-    send_new_articles_batched(new_articles);
+    batch_send_unified_digest(sorted_paper_dicts, total_citing_papers, total_authors, total_new_articles, total_unique_papers, global_config.papers_per_merged_email)
   }
 }
 
