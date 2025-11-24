@@ -7,7 +7,41 @@ global_config = {
   // Search for the sender of the email
   'senderEmail': 'scholaralerts-noreply@google.com',
   // After sending the digest should the email get marked as unread
-  'mark_as_unread': true
+  'mark_as_unread': true,
+  // Label to mark processed emails (prevents reprocessing)
+  'processed_label': 'scholar-alerts-processed'
+}
+
+/*Normalize URLs to remove tracking parameters and ensure consistent format*/
+function normalize_url(url) {
+  if (!url) return '';
+
+  try {
+    // Remove common tracking parameters
+    var urlObj = new URL(url);
+    var paramsToRemove = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+                          'fbclid', 'gclid', 'mc_cid', 'mc_eid', '_ga', 'ref', 'source'];
+
+    paramsToRemove.forEach(param => {
+      urlObj.searchParams.delete(param);
+    });
+
+    // Normalize protocol to https
+    if (urlObj.protocol === 'http:') {
+      urlObj.protocol = 'https:';
+    }
+
+    // Remove trailing slash
+    var normalized = urlObj.toString();
+    if (normalized.endsWith('/')) {
+      normalized = normalized.slice(0, -1);
+    }
+
+    return normalized;
+  } catch (e) {
+    // If URL parsing fails, return the original URL
+    return url;
+  }
 }
 
 /*Parse the body for the email which cites papers of a specific author*/
@@ -103,7 +137,7 @@ function parse_citations_email(plainBody) {
     }
     var paper_dict = {
       "title": title_text,
-      "url": url_line,
+      "url": normalize_url(url_line),
       "metadata": metadata_text,
       "cites": cites_text,
       "snippet": snippet_text
@@ -147,34 +181,56 @@ function parse_new_article_email(htmlBody, subject) {
       snippet = snippetMatch[1].replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]*>/g, '').trim();
     }
 
+    var normalized_url = normalize_url(url);
     var paper_dict = {
       "title": title,
-      "url": url,
+      "url": normalized_url,
       "metadata": metadata,
       "cites": "", // New articles don't cite anyone
       "snippet": snippet,
       "source": "new_article" // Mark source type
     }
 
-    parsed_papers[url] = paper_dict; // Use URL as key for better deduplication
+    parsed_papers[normalized_url] = paper_dict; // Use normalized URL as key for better deduplication
   }
 
   return parsed_papers;
 }
 
 /*Unified function to deduplicate and collate papers from all sources (citations and new articles)
-Takes citation papers (keyed by author) and new article papers, deduplicates by URL, and returns sorted list*/
+Takes citation papers (keyed by author) and new article papers, deduplicates by URL and title, and returns sorted list*/
 function collate_all_papers(authorname2parsed_papers, new_article_papers){
   var url2paper = {}
   var url2authors = {}
+  var title2url = {} // Track titles to detect duplicates with different URLs
 
   // Process citation papers (Type 1)
   for (const [authorname, title2parsed_papers] of Object.entries(authorname2parsed_papers)) {
     for (const [title, parsed_paper] of Object.entries(title2parsed_papers)) {
       var url = parsed_paper['url'];
+      var paper_title = parsed_paper['title'];
 
-      if (url in url2paper) {
-        // Paper already exists, add this author to the citations list
+      // Check if we've seen this title before (even with a different URL)
+      var existing_url = title2url[paper_title];
+
+      if (existing_url && existing_url in url2paper) {
+        // Paper with same title already exists (might have different URL) - merge with existing
+        url = existing_url; // Use the existing URL to ensure we merge properly
+
+        if (url in url2authors) {
+          url2authors[url].push(authorname);
+        } else {
+          url2authors[url] = [authorname];
+        }
+
+        // Add citation info
+        if (parsed_paper['cites'] == ''){
+          url2paper[url]['cites'].push(`Cites ${authorname}`);
+        } else {
+          url2paper[url]['cites'].push(`Cites ${authorname}: ${parsed_paper['cites']}`);
+        }
+      } else if (url in url2paper) {
+        // Paper with same URL already exists, add this author to the citations list
         if (url in url2authors) {
           url2authors[url].push(authorname);
         } else {
@@ -188,10 +244,11 @@ function collate_all_papers(authorname2parsed_papers, new_article_papers){
           url2paper[url]['cites'].push(`Cites ${authorname}: ${parsed_paper['cites']}`);
         }
       } else {
-        // First time seeing this paper
+        // First time seeing this paper (both URL and title)
         url2authors[url] = [authorname];
         url2paper[url] = parsed_paper;
         url2paper[url]['source'] = 'citation';
+        title2url[paper_title] = url; // Track this title
 
         if (parsed_paper['cites'] == ''){
           url2paper[url]['cites'] = [`Cites ${authorname}`];
@@ -204,8 +261,14 @@ function collate_all_papers(authorname2parsed_papers, new_article_papers){
 
   // Process new article papers (Type 2)
   for (const [url, parsed_paper] of Object.entries(new_article_papers)) {
-    if (url in url2paper) {
-      // Paper already exists in citations - just mark that it's also from new articles
+    var paper_title = parsed_paper['title'];
+    var existing_url = title2url[paper_title];
+
+    if (existing_url && existing_url in url2paper) {
+      // Paper with same title already exists - merge with existing
+      url2paper[existing_url]['source'] = 'both';
+    } else if (url in url2paper) {
+      // Paper with same URL already exists in citations - just mark that it's also from new articles
       url2paper[url]['source'] = 'both'; // Appears in both citation alerts and new article alerts
     } else {
       // New paper not seen in citations
@@ -213,6 +276,7 @@ function collate_all_papers(authorname2parsed_papers, new_article_papers){
       url2paper[url]['source'] = 'new_article';
       url2paper[url]['cites'] = []; // No citations for new articles
       url2authors[url] = [];
+      title2url[paper_title] = url; // Track this title
     }
   }
 
@@ -460,12 +524,19 @@ function batch_send_citation_email(sorted_paper_dicts, total_citing_papers, tota
 
 
 function mergeRecentScholarAlerts() {
+  // Get or create the processed label
+  var label = GmailApp.getUserLabelByName(global_config.processed_label);
+  if (!label) {
+    label = GmailApp.createLabel(global_config.processed_label);
+  }
+
   // Construct a search query for emails from scholar alerts in the past_day_range
+  // Exclude emails that have already been processed
   var now = new Date();
   var start_date = new Date(now);
   start_date.setDate(now.getDate() - global_config.past_day_range);
   var formatted_startdate = Utilities.formatDate(start_date, Session.getScriptTimeZone(), "yyyy/MM/dd");
-  var searchQuery = 'from:' + global_config.senderEmail + ' after:' + formatted_startdate;
+  var searchQuery = 'from:' + global_config.senderEmail + ' after:' + formatted_startdate + ' -label:' + global_config.processed_label;
 
   var threads = GmailApp.search(searchQuery);
 
@@ -509,6 +580,9 @@ function mergeRecentScholarAlerts() {
         new_article_papers = Object.assign(new_article_papers, parsed_article);
         total_new_articles += Object.keys(parsed_article).length;
       }
+
+      // Mark this message as processed
+      threads[i].addLabel(label);
     }
   }
 
